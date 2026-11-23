@@ -1,7 +1,13 @@
-// A tiny static server for game/ (Node 22, standard library only), so an entry can be played
-// locally without a build step: `node serve.ts` serves game/ on http://localhost:8080.
-// It sends the MIME types a browser game needs, refuses any path outside game/, and otherwise
-// does nothing clever: this is a development convenience, not a web server for the internet.
+// Vice Harbor v2.3 — a tiny static server for game/ (Node 22, standard
+// library only), so an entry can be played locally without a build step:
+// `node serve.ts` serves game/ on http://localhost:8080. It sends the MIME
+// types a browser game needs, refuses any path outside game/, logs each
+// request to the console when --verbose is passed, and otherwise does
+// nothing clever: this is a development convenience, not a web server for
+// the internet. Pass --port <n> to listen on another port, --host <addr> to
+// listen on another interface (127.0.0.1 by default). v2.3 answers every
+// request through one small pipeline — parse, resolve, check, send — so
+// the happy path reads top to bottom and every error has one place.
 import { createReadStream, statSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { extname, join, normalize, resolve, sep } from 'node:path';
@@ -9,9 +15,18 @@ import { fileURLToPath } from 'node:url';
 
 const root = resolve(fileURLToPath(new URL('./game', import.meta.url)));
 const args = process.argv.slice(2);
-const portIndex = args.indexOf('--port');
-const requested = portIndex === -1 ? 8080 : Number(args[portIndex + 1]);
-const port = Number.isInteger(requested) && requested > 0 && requested < 65536 ? requested : 8080;
+
+/** The value after `--flag`, or `fallback` when it is missing. */
+function flagValue(flag, fallback) {
+  const index = args.indexOf(flag);
+  if (index === -1 || index + 1 >= args.length) return fallback;
+  return args[index + 1];
+}
+
+const requestedPort = Number(flagValue('--port', '8080'));
+const port = Number.isInteger(requestedPort) && requestedPort > 0 && requestedPort < 65536 ? requestedPort : 8080;
+const host = flagValue('--host', '127.0.0.1');
+const verbose = args.includes('--verbose');
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -37,36 +52,72 @@ const MIME: Record<string, string> = {
   '.txt': 'text/plain; charset=utf-8',
 };
 
-createServer((request, response) => {
-  const url = new URL(request.url ?? '/', 'http://localhost');
-  let pathname: string;
-  try {
-    pathname = decodeURIComponent(url.pathname);
-  } catch {
-    response.writeHead(400).end('bad request');
-    return;
-  }
-  if (pathname.endsWith('/')) pathname += 'index.html';
-  const file = resolve(join(root, normalize(pathname)));
-  if (file !== root && !file.startsWith(root + sep)) {
-    response.writeHead(403).end('forbidden');
-    return;
-  }
+/** The MIME type for a file, from its extension. */
+function mimeFor(file: string): string {
+  return MIME[extname(file).toLowerCase()] ?? 'application/octet-stream';
+}
+
+/** One log line, only when --verbose is passed. */
+function log(status: number, pathname: string, extra?: string) {
+  if (!verbose) return;
+  console.log(`${status} ${pathname}${extra ? ` (${extra})` : ''}`);
+}
+
+/** Resolve a request path to a file under game/, or null when it escapes. */
+function resolveFile(pathname: string): string | null {
+  let path = pathname;
+  if (path.endsWith('/')) path += 'index.html';
+  const file = resolve(join(root, normalize(path)));
+  if (file !== root && !file.startsWith(root + sep)) return null;
+  return file;
+}
+
+/** Answer with a short error body and one log line. */
+function fail(response, status: number, pathname: string, body: string) {
+  log(status, pathname);
+  response.writeHead(status).end(body);
+}
+
+/** Serve one file: headers, then the body — or nothing for a HEAD request. */
+function serveFile(response, file: string, pathname: string, method: string) {
   let size: number;
   try {
     const stats = statSync(file);
     if (!stats.isFile()) throw new Error('not a file');
     size = stats.size;
   } catch {
-    response.writeHead(404).end('not found');
+    fail(response, 404, pathname, 'not found');
     return;
   }
+  log(200, pathname, `${size} bytes`);
   response.writeHead(200, {
-    'content-type': MIME[extname(file).toLowerCase()] ?? 'application/octet-stream',
+    'content-type': mimeFor(file),
     'content-length': size,
     'cache-control': 'no-store',
   });
+  // A HEAD request gets the headers and no body.
+  if (method === 'HEAD') {
+    response.end();
+    return;
+  }
   createReadStream(file).pipe(response);
-}).listen(port, '127.0.0.1', () => {
-  console.log(`game/ is on http://localhost:${port}`);
+}
+
+createServer((request, response) => {
+  const url = new URL(request.url ?? '/', 'http://localhost');
+  let pathname: string;
+  try {
+    pathname = decodeURIComponent(url.pathname);
+  } catch {
+    fail(response, 400, url.pathname, 'bad request');
+    return;
+  }
+  const file = resolveFile(pathname);
+  if (!file) {
+    fail(response, 403, pathname, 'forbidden');
+    return;
+  }
+  serveFile(response, file, pathname, request.method ?? 'GET');
+}).listen(port, host, () => {
+  console.log(`game/ is on http://${host}:${port}`);
 });

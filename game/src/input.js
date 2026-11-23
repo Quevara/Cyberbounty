@@ -1,64 +1,105 @@
-// Keyboard and mouse input for Vice Harbor. Held keys give a movement vector;
-// one-shot presses (confirm, pause, steal a car, mission list) are queued as bit
-// flags and taken once by the loop, so a press between two frames is never lost
-// and never counted twice. The mouse gives an aim angle in world space.
+// Vice Harbor v2.3 — keyboard and mouse input. Held keys give a movement
+// vector; one-shot presses (confirm, pause, steal a car, mission list,
+// punch, mute, garage, buy a track) are queued as bit flags and taken
+// once by the loop, so a press between two frames is never lost and
+// never counted twice. The mouse gives an aim angle in world space. The
+// same shape is what the screenshot autopilot fakes. v2.3 keeps the
+// bindings as one table (action, codes, held or one-shot) but looks them
+// up through a Map built once at boot, tracks how long each held key has
+// been down (the loop uses it for the run feel and the nitro boost), and
+// ignores the browser's own shortcuts so a game key never reloads the
+// page. The new rows are the garage: G opens Otto's shop at the door,
+// and 1, 2 and 3 buy the engine, armour and nitro tracks while it is open.
 
 export const ACTION_CONFIRM = 1;
 export const ACTION_PAUSE = 2;
 export const ACTION_ENTER_CAR = 4;
 export const ACTION_MISSIONS = 8;
 export const ACTION_PUNCH = 16;
+export const ACTION_MUTE = 32;
+export const ACTION_GARAGE = 64;
+export const ACTION_BUY_ENGINE = 128;
+export const ACTION_BUY_ARMOUR = 256;
+export const ACTION_BUY_NITRO = 512;
 
-const UP = new Set(['ArrowUp', 'KeyW']);
-const DOWN = new Set(['ArrowDown', 'KeyS']);
-const LEFT = new Set(['ArrowLeft', 'KeyA']);
-const RIGHT = new Set(['ArrowRight', 'KeyD']);
-const CONFIRM = new Set(['Space', 'Enter']);
-const PAUSE = new Set(['KeyP', 'Escape']);
-const ENTER_CAR = new Set(['KeyE']);
-const MISSIONS = new Set(['KeyM']);
-const PUNCH = new Set(['KeyF']);
+/** One row per action: the flag, the key codes, and whether it is held. */
+const BINDINGS = [
+  { flag: 0, codes: ['ArrowUp', 'KeyW'], held: 'up' },
+  { flag: 0, codes: ['ArrowDown', 'KeyS'], held: 'down' },
+  { flag: 0, codes: ['ArrowLeft', 'KeyA'], held: 'left' },
+  { flag: 0, codes: ['ArrowRight', 'KeyD'], held: 'right' },
+  { flag: 0, codes: ['ShiftLeft', 'ShiftRight'], held: 'run' },
+  { flag: ACTION_CONFIRM, codes: ['Space', 'Enter'] },
+  { flag: ACTION_PAUSE, codes: ['KeyP', 'Escape'] },
+  { flag: ACTION_ENTER_CAR, codes: ['KeyE'] },
+  { flag: ACTION_MISSIONS, codes: ['KeyM'] },
+  { flag: ACTION_PUNCH, codes: ['KeyF'] },
+  { flag: ACTION_MUTE, codes: ['KeyN'] },
+  { flag: ACTION_GARAGE, codes: ['KeyG'] },
+  { flag: ACTION_BUY_ENGINE, codes: ['Digit1', 'Numpad1'] },
+  { flag: ACTION_BUY_ARMOUR, codes: ['Digit2', 'Numpad2'] },
+  { flag: ACTION_BUY_NITRO, codes: ['Digit3', 'Numpad3'] },
+];
+
+/** Key code -> binding row, built once so every event is one lookup. */
+const BINDING_BY_CODE = new Map();
+for (const row of BINDINGS) {
+  for (const code of row.codes) BINDING_BY_CODE.set(code, row);
+}
+
+/** Key codes the game swallows so the browser never acts on them. */
+const SWALLOWED = new Set(['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']);
 
 export function createInput(canvas, toWorld) {
   const held = { up: false, down: false, left: false, right: false, run: false };
+  const heldSince = { up: 0, down: 0, left: 0, right: 0, run: 0 };
   let actions = 0;
   let mouseDown = false;
   let mouseX = 0;
   let mouseY = 0;
+  let hasMouse = false;
 
-  window.addEventListener('keydown', (event) => {
-    if (UP.has(event.code)) held.up = true;
-    else if (DOWN.has(event.code)) held.down = true;
-    else if (LEFT.has(event.code)) held.left = true;
-    else if (RIGHT.has(event.code)) held.right = true;
-    else if (event.code === 'ShiftLeft' || event.code === 'ShiftRight') held.run = true;
-    else if (CONFIRM.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_CONFIRM;
-    } else if (PAUSE.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_PAUSE;
-    } else if (ENTER_CAR.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_ENTER_CAR;
-    } else if (MISSIONS.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_MISSIONS;
-    } else if (PUNCH.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_PUNCH;
-    } else return;
-    if (event.code !== 'F5') event.preventDefault();
-  });
-  window.addEventListener('keyup', (event) => {
-    if (UP.has(event.code)) held.up = false;
-    else if (DOWN.has(event.code)) held.down = false;
-    else if (LEFT.has(event.code)) held.left = false;
-    else if (RIGHT.has(event.code)) held.right = false;
-    else if (event.code === 'ShiftLeft' || event.code === 'ShiftRight') held.run = false;
-  });
-  // A key released while the tab is hidden never sends keyup: let go on blur.
-  window.addEventListener('blur', () => {
-    held.up = held.down = held.left = held.right = held.run = false;
+  function releaseAll() {
+    held.up = false;
+    held.down = false;
+    held.left = false;
+    held.right = false;
+    held.run = false;
+    heldSince.up = 0;
+    heldSince.down = 0;
+    heldSince.left = 0;
+    heldSince.right = 0;
+    heldSince.run = 0;
     mouseDown = false;
-  });
+  }
+
+  function onKeyDown(event) {
+    const row = BINDING_BY_CODE.get(event.code);
+    if (!row) return;
+    if (row.held) {
+      if (!held[row.held]) heldSince[row.held] = performance.now();
+      held[row.held] = true;
+    } else if (!event.repeat) {
+      actions |= row.flag;
+    }
+    if (SWALLOWED.has(event.code)) event.preventDefault();
+  }
+
+  function onKeyUp(event) {
+    const row = BINDING_BY_CODE.get(event.code);
+    if (row && row.held) {
+      held[row.held] = false;
+      heldSince[row.held] = 0;
+    }
+  }
+
+  window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('keyup', onKeyUp);
+  // A key released while the tab is hidden never sends keyup: let go on blur.
+  window.addEventListener('blur', releaseAll);
   canvas.addEventListener('pointerdown', (event) => {
     mouseDown = true;
+    hasMouse = true;
     mouseX = event.clientX;
     mouseY = event.clientY;
     actions |= ACTION_CONFIRM;
@@ -66,7 +107,11 @@ export function createInput(canvas, toWorld) {
   canvas.addEventListener('pointerup', () => {
     mouseDown = false;
   });
+  canvas.addEventListener('pointercancel', () => {
+    mouseDown = false;
+  });
   canvas.addEventListener('pointermove', (event) => {
+    hasMouse = true;
     mouseX = event.clientX;
     mouseY = event.clientY;
   });
@@ -84,6 +129,15 @@ export function createInput(canvas, toWorld) {
     running() {
       return held.run;
     },
+    /** Milliseconds the named held key has been down, or 0 when it is up. */
+    heldFor(name) {
+      if (!held[name]) return 0;
+      return performance.now() - heldSince[name];
+    },
+    /** True when the pointer has ever moved over the canvas. */
+    hasMouse() {
+      return hasMouse;
+    },
     /** The one-shot presses since the last call, as ACTION_* flags. */
     takeActions() {
       const taken = actions;
@@ -94,6 +148,8 @@ export function createInput(canvas, toWorld) {
     clearActions() {
       actions = 0;
     },
+    /** Drop every held key as well, for example when the run restarts. */
+    releaseAll,
     shooting() {
       return mouseDown;
     },
